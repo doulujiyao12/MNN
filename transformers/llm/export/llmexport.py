@@ -500,11 +500,23 @@ class LlmExporter(torch.nn.Module):
                 quant_bit_visual = self.args.visual_quant_bit
             if self.args.visual_quant_block is not None:
                 quant_block_visual = self.args.visual_quant_block
-            self.mnn_converter.export(vision_onnx, quant_bit_visual,
-                                      quant_block_visual,
-                                      transformer_fuse=fuse_transformer,
-                                      group_conv_native=native_group_conv,
-                                      weight_sym=self.args.visual_sym)
+            if self.args.visual_gptq_path is not None:
+                # GPTQ path: onnx2mnn(fp16) -> mnn2json -> apply visual gptq(blocks->int8) -> json2mnn
+                # merger/deepstack/patch_embed keep fp16, only blocks are replaced with GPTQ int8
+                self.mnn_converter.export_visual_with_gptq(
+                    vision_onnx,
+                    self.args.visual_gptq_path,
+                    quant_block=quant_block_visual if quant_block_visual else 128,
+                    transformer_fuse=fuse_transformer,
+                    group_conv_native=native_group_conv,
+                    weight_sym=self.args.visual_sym
+                )
+            else:
+                self.mnn_converter.export(vision_onnx, quant_bit_visual,
+                                          quant_block_visual,
+                                          transformer_fuse=fuse_transformer,
+                                          group_conv_native=native_group_conv,
+                                          weight_sym=self.args.visual_sym)
 
     def export_audio(self):
         if self.audio is None:
@@ -559,7 +571,7 @@ class LlmExporter(torch.nn.Module):
         self.export_mtp()
         self.export_tokenizer()
         self.export_config(export_mnn)
-        if export_mnn:
+        if export_mnn and self.args.cleanup_onnx:
             # delete onnx file
             try:
                 for file in glob.glob(f'{self.onnx_path}/*'):
@@ -682,13 +694,14 @@ class EmbeddingExporter(LlmExporter):
             tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=transformer_fuse)
             if tie_embeddings_info is not None:
                 self.llm_config['tie_embeddings'] = tie_embeddings_info
-            # delete onnx file
-            try:
-                for file in glob.glob(f'{self.onnx_path}/*'):
-                    os.remove(file)
-                os.rmdir(self.onnx_path)
-            except Exception as e:
-                print(f"remove onnx error: {e}")
+            if self.args.cleanup_onnx:
+                # delete onnx file
+                try:
+                    for file in glob.glob(f'{self.onnx_path}/*'):
+                        os.remove(file)
+                    os.rmdir(self.onnx_path)
+                except Exception as e:
+                    print(f"remove onnx error: {e}")
 
 def build_args(parser):
     parser.add_argument('--path', type=str, required=True,
@@ -703,11 +716,13 @@ def build_args(parser):
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
+    parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
+    parser.add_argument('--cleanup_onnx', action='store_true', help='Delete intermediate onnx files after export.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
     parser.add_argument('--quant_block', type=int, default=64, help='mnn quant block, 0 mean channel-wise, default is 64.')
     parser.add_argument('--visual_quant_bit', type=int, default=None, help='mnn visual quant bit, 4 or 8, default is setting in utils/vision.py by different vit model.')
@@ -769,6 +784,7 @@ def main():
         llm_exporter.response(args.test)
 
     if args.export is not None:
+        print('export model to', args.export)
         llm_exporter.export(args.export)
 
 if __name__ == '__main__':
